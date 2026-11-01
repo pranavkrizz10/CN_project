@@ -1,0 +1,654 @@
+==============================================================================
+                           COMPLETE DATA LINK LAYER                           
+              Go-Back-N  +  Hamming Codes  +  CSMA/CA  +  PyShark             
+==============================================================================
+
+
+##############################################################################
+#             SECTION 1 : ERROR CONTROL  (Hamming SECDED codes)              #
+##############################################################################
+Hamming codes add parity bits so the receiver can CORRECT a single-bit
+error and DETECT a double-bit error entirely on its own. Below we encode
+one byte, then show all three outcomes on its coded form.
+
+  Original data byte : 'A' = 0x41 = 01000001
+  Hamming-coded form : cc69  (2 bytes = two 8-bit SECDED codewords)
+
+  (a) No error      -> decoded 0x41 'A'  status=NO_ERROR
+  (b) 1 bit flipped -> decoded 0x41 'A'  status=CORRECTED   <- repaired automatically, no retransmit
+  (c) 2 bits flipped-> status=DOUBLE_ERROR   <- detected, so Go-Back-N will retransmit this frame
+
+
+##############################################################################
+#         SECTION 2 : FLOW CONTROL + ERROR RECOVERY  (Go-Back-N ARQ)         #
+##############################################################################
+==============================================================================
+ GO-BACK-N ARQ  --  flow control, error recovery & in-order delivery
+==============================================================================
+ Message to send : 'DATA-LINK-OK'
+ Window size N   : 2
+ Payload / frame : 2 byte(s)
+ Total frames    : 6
+------------------------------------------------------------------------------
+
+[ROUND 1]  window = [base=0 .. 1]   next_to_send=0
+  SEND  DATA seq=0 data='DA'   [window slot 1/2]
+  SEND  DATA seq=1 data='TA'   [window slot 2/2]
+  FLOW CONTROL: window FULL (2 frames in flight). Must wait for ACKs before sending seq=2.
+      RECV  seq=0: clean, data='DA' -> ACCEPTED
+      ACK   receiver -> sender: ack=1 ("send me 1 next")
+      WIRE  seq=1: 1-bit error injected in coded byte #0
+      RECV  seq=1: single-bit error CORRECTED by Hamming, data='TA' -> ACCEPTED (no retransmit needed)
+      ACK   receiver -> sender: ack=2 ("send me 2 next")
+  SLIDE window: base 0 -> 2 (frames 0..1 acknowledged)
+
+[ROUND 2]  window = [base=2 .. 3]   next_to_send=2
+  SEND  DATA seq=2 data='-L'   [window slot 1/2]
+  SEND  DATA seq=3 data='IN'   [window slot 2/2]
+  FLOW CONTROL: window FULL (2 frames in flight). Must wait for ACKs before sending seq=4.
+      WIRE  seq=2: LOST (frame dropped by medium)  (no ACK will return)
+      RECV  seq=3: OUT OF ORDER (expected 2) -> DISCARDED. Re-ACK expecting 2
+      ACK   receiver -> sender: ack=2 ("send me 2 next")
+  !! TIMEOUT: no progress for base=2. GO BACK N -> rewind next_to_send from 4 to 2 and retransmit 2 frame(s).
+
+[ROUND 3]  window = [base=2 .. 3]   next_to_send=2
+  SEND  DATA seq=2 data='-L'   [window slot 1/2]
+  SEND  DATA seq=3 data='IN'   [window slot 2/2]
+  FLOW CONTROL: window FULL (2 frames in flight). Must wait for ACKs before sending seq=4.
+      RECV  seq=2: clean, data='-L' -> ACCEPTED
+      ACK   receiver -> sender: ack=3 ("send me 3 next")
+      RECV  seq=3: clean, data='IN' -> ACCEPTED
+      ACK   receiver -> sender: ack=4 ("send me 4 next")
+  SLIDE window: base 2 -> 4 (frames 2..3 acknowledged)
+
+[ROUND 4]  window = [base=4 .. 5]   next_to_send=4
+  SEND  DATA seq=4 data='K-'   [window slot 1/2]
+  SEND  DATA seq=5 data='OK'   [window slot 2/2]
+      WIRE  seq=4: 2-bit error injected in coded byte #1
+      RECV  seq=4: payload has a DOUBLE-bit error -> DISCARDED (Hamming can't fix). Re-ACK expecting 4
+      ACK   receiver -> sender: ack=4 ("send me 4 next")
+      RECV  seq=5: OUT OF ORDER (expected 4) -> DISCARDED. Re-ACK expecting 4
+      ACK   receiver -> sender: ack=4 ("send me 4 next")
+  !! TIMEOUT: no progress for base=4. GO BACK N -> rewind next_to_send from 6 to 4 and retransmit 2 frame(s).
+
+[ROUND 5]  window = [base=4 .. 5]   next_to_send=4
+  SEND  DATA seq=4 data='K-'   [window slot 1/2]
+  SEND  DATA seq=5 data='OK'   [window slot 2/2]
+      RECV  seq=4: clean, data='K-' -> ACCEPTED
+      ACK   receiver -> sender: ack=5 ("send me 5 next")
+      RECV  seq=5: clean, data='OK' -> ACCEPTED
+      ACK   receiver -> sender: ack=6 ("send me 6 next")
+  SLIDE window: base 4 -> 6 (frames 4..5 acknowledged)
+
+==============================================================================
+ GO-BACK-N COMPLETE
+==============================================================================
+  Frames delivered IN ORDER : 6/6
+  Single-bit errors fixed   : 1 (by Hamming, no retransmit)
+  Timeouts (go-back-N)      : 2
+  Frames retransmitted      : 4
+  Reassembled message       : 'DATA-LINK-OK'
+  Message intact?           : YES ✓
+
+
+##############################################################################
+#                   SECTION 3 : MULTIPLE ACCESS  (CSMA/CA)                   #
+##############################################################################
+==============================================================================
+ CSMA/CA  --  multiple access with collision avoidance
+==============================================================================
+ Stations contending : A, B, C
+ Access point (AP)   : 02:00:00:00:00:AA
+ RTS/CTS handshake   : ON
+ CWmin / CWmax       : 4 / 64
+------------------------------------------------------------------------------
+
+ All stations sense the medium IDLE, wait DIFS (2 slots), then pick a random backoff in [0, 3]:
+   A: backoff = 1
+   B: backoff = 3
+   C: backoff = 1
+
+ Counting down (one idle slot = -1 on every pending backoff;
+ the first to reach 0 transmits; ties collide):
+    slot   2: idle, count down    [A=1  B=3  C=1]
+    slot   3: !!! COLLISION !!! A, C transmitted in the SAME slot
+            A: no ACK -> binary exponential backoff, CW 4 -> 8, new random backoff = 5
+            C: no ACK -> binary exponential backoff, CW 4 -> 8, new random backoff = 4
+            medium wasted for 2 slots.
+    slot   7: idle, count down    [A=5  B=2  C=4]
+    slot   8: idle, count down    [A=4  B=1  C=3]
+    slot   9: *** B wins the medium (backoff reached 0) ***
+            RTS  B -> AP   : 'may I send?'  (all others set NAV and stay quiet)
+            CTS  AP -> B   : 'go ahead'  (after SIFS)
+            DATA B -> AP   : sending its frame
+            ACK  AP -> B   : received OK  (after SIFS)
+            medium BUSY for 3 slots; other stations FREEZE their backoff counters.
+    slot  14: idle, count down    [A=3  C=2]
+    slot  15: idle, count down    [A=2  C=1]
+    slot  16: *** C wins the medium (backoff reached 0) ***
+            RTS  C -> AP   : 'may I send?'  (all others set NAV and stay quiet)
+            CTS  AP -> C   : 'go ahead'  (after SIFS)
+            DATA C -> AP   : sending its frame
+            ACK  AP -> C   : received OK  (after SIFS)
+            medium BUSY for 3 slots; other stations FREEZE their backoff counters.
+    slot  21: idle, count down    [A=1]
+    slot  22: *** A wins the medium (backoff reached 0) ***
+            RTS  A -> AP   : 'may I send?'  (all others set NAV and stay quiet)
+            CTS  AP -> A   : 'go ahead'  (after SIFS)
+            DATA A -> AP   : sending its frame
+            ACK  AP -> A   : received OK  (after SIFS)
+            medium BUSY for 3 slots; other stations FREEZE their backoff counters.
+
+==============================================================================
+ CSMA/CA COMPLETE
+==============================================================================
+  A: delivered its frame after 1 collision(s), final CW=4
+  B: delivered its frame after 0 collision(s), final CW=4
+  C: delivered its frame after 1 collision(s), final CW=4
+  Total collisions on the medium : 1
+  All stations transmitted?      : YES ✓
+
+
+##############################################################################
+#                 SECTION 4 : PACKET INSPECTION WITH PYSHARK                 #
+##############################################################################
+Saving every transmitted frame as a real Ethernet packet into a .pcap file...
+
+  Wrote 33 Ethernet packets to '/home/claude/datalink_layer/output/datalink_capture.pcap'
+
+==============================================================================
+ PYSHARK PACKET INSPECTION -- FLOW CONTROL / ERROR CONTROL (Go-Back-N frames)
+==============================================================================
+ (each packet below was written by Scapy and read back by PyShark)
+
+  ---- Packet #1  [go-back-n]  (S->R)  note: clean ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 24 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 4 byte(s)
+          payload    = cccccc69  (Hamming-coded)
+          Hamming    = no error
+          decoded    = 'DA'
+
+  ---- Packet #2  [go-back-n]  (R->S)  note: cumulative ACK=1 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 1
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #3  [go-back-n]  (S->R)  note: 1-bit error injected in coded byte #0 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 24 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 1
+          ack_num    = 0
+          flags      = 0x01 (CORRUPTED flag set by medium)
+          payload_len= 4 byte(s)
+          payload    = b5cccc69  (Hamming-coded)
+          Hamming    = single-bit error CORRECTED (1 byte(s) repaired)
+          decoded    = 'TA'
+
+  ---- Packet #4  [go-back-n]  (R->S)  note: cumulative ACK=2 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 2
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #5  [go-back-n]  (S->R)  note: LOST (frame dropped by medium) ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 24 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 2
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 4 byte(s)
+          payload    = aa55cc3c  (Hamming-coded)
+          Hamming    = no error
+          decoded    = '-L'
+
+  ---- Packet #6  [go-back-n]  (S->R)  note: clean ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 24 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 3
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 4 byte(s)
+          payload    = cc99cc96  (Hamming-coded)
+          Hamming    = no error
+          decoded    = 'IN'
+
+  ---- Packet #7  [go-back-n]  (R->S)  note: cumulative ACK=2 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 2
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #8  [go-back-n]  (S->R)  note: clean ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 24 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 2
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 4 byte(s)
+          payload    = aa55cc3c  (Hamming-coded)
+          Hamming    = no error
+          decoded    = '-L'
+
+  ---- Packet #9  [go-back-n]  (R->S)  note: cumulative ACK=3 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 3
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #10  [go-back-n]  (S->R)  note: clean ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 24 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 3
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 4 byte(s)
+          payload    = cc99cc96  (Hamming-coded)
+          Hamming    = no error
+          decoded    = 'IN'
+
+  ---- Packet #11  [go-back-n]  (R->S)  note: cumulative ACK=4 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 4
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #12  [go-back-n]  (S->R)  note: 2-bit error injected in coded byte #1 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 24 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 4
+          ack_num    = 0
+          flags      = 0x01 (CORRUPTED flag set by medium)
+          payload_len= 4 byte(s)
+          payload    = cc17aa55  (Hamming-coded)
+          Hamming    = DOUBLE-bit error DETECTED (uncorrectable -> frame dropped)
+          decoded    = 'O-'
+
+  ---- Packet #13  [go-back-n]  (R->S)  note: cumulative ACK=4 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 4
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #14  [go-back-n]  (S->R)  note: clean ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 24 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 5
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 4 byte(s)
+          payload    = ccffcc33  (Hamming-coded)
+          Hamming    = no error
+          decoded    = 'OK'
+
+  ---- Packet #15  [go-back-n]  (R->S)  note: cumulative ACK=4 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 4
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #16  [go-back-n]  (S->R)  note: clean ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 24 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 4
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 4 byte(s)
+          payload    = cc33aa55  (Hamming-coded)
+          Hamming    = no error
+          decoded    = 'K-'
+
+  ---- Packet #17  [go-back-n]  (R->S)  note: cumulative ACK=5 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 5
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #18  [go-back-n]  (S->R)  note: clean ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 24 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 5
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 4 byte(s)
+          payload    = ccffcc33  (Hamming-coded)
+          Hamming    = no error
+          decoded    = 'OK'
+
+  ---- Packet #19  [go-back-n]  (R->S)  note: cumulative ACK=6 ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 6
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  PyShark displayed 19 packet(s).
+
+==============================================================================
+ PYSHARK PACKET INSPECTION -- MULTIPLE ACCESS (CSMA/CA frames)
+==============================================================================
+ (each packet below was written by Scapy and read back by PyShark)
+
+  ---- Packet #20  [csma-ca]  (MAC)  note: A's frame destroyed in collision ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:aa
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = RTS (4)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #21  [csma-ca]  (MAC)  note: C's frame destroyed in collision ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:03
+          dst MAC    = 02:00:00:00:00:aa
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = RTS (4)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #22  [csma-ca]  (MAC)  note: B sends RTS (Request To Send) ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:aa
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = RTS (4)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #23  [csma-ca]  (MAC)  note: AP replies CTS (Clear To Send) ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:aa
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = CTS (5)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #24  [csma-ca]  (MAC)  note: B transmits DATA ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:02
+          dst MAC    = 02:00:00:00:00:aa
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 32 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 12 byte(s)
+          payload    = 66660faa66ff6655aa00ccaa  (Hamming-coded)
+          Hamming    = no error
+          decoded    = 'from B'
+
+  ---- Packet #25  [csma-ca]  (MAC)  note: AP acknowledges the DATA ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:aa
+          dst MAC    = 02:00:00:00:00:02
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #26  [csma-ca]  (MAC)  note: C sends RTS (Request To Send) ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:03
+          dst MAC    = 02:00:00:00:00:aa
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = RTS (4)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #27  [csma-ca]  (MAC)  note: AP replies CTS (Clear To Send) ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:aa
+          dst MAC    = 02:00:00:00:00:03
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = CTS (5)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #28  [csma-ca]  (MAC)  note: C transmits DATA ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:03
+          dst MAC    = 02:00:00:00:00:aa
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 32 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 12 byte(s)
+          payload    = 66660faa66ff6655aa00ccc3  (Hamming-coded)
+          Hamming    = no error
+          decoded    = 'from C'
+
+  ---- Packet #29  [csma-ca]  (MAC)  note: AP acknowledges the DATA ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:aa
+          dst MAC    = 02:00:00:00:00:03
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #30  [csma-ca]  (MAC)  note: A sends RTS (Request To Send) ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:aa
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = RTS (4)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #31  [csma-ca]  (MAC)  note: AP replies CTS (Clear To Send) ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:aa
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = CTS (5)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  ---- Packet #32  [csma-ca]  (MAC)  note: A transmits DATA ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:01
+          dst MAC    = 02:00:00:00:00:aa
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 32 bytes on the wire
+      Data-Link header:
+          frame_type = DATA (1)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 12 byte(s)
+          payload    = 66660faa66ff6655aa00cc69  (Hamming-coded)
+          Hamming    = no error
+          decoded    = 'from A'
+
+  ---- Packet #33  [csma-ca]  (MAC)  note: AP acknowledges the DATA ----
+      Ethernet II (dissected by PyShark):
+          src MAC    = 02:00:00:00:00:aa
+          dst MAC    = 02:00:00:00:00:01
+          EtherType  = 0x88b5  (custom data-link protocol)
+          frame len  = 20 bytes on the wire
+      Data-Link header:
+          frame_type = ACK (2)
+          seq_num    = 0
+          ack_num    = 0
+          flags      = 0x00
+          payload_len= 0 byte(s)
+
+  PyShark displayed 14 packet(s).
+
+  The capture file is at: /home/claude/datalink_layer/output/datalink_capture.pcap
+  You can also open it in Wireshark (filter: eth.type == 0x88b5).
+
+
+##############################################################################
+#                   ALL FEATURES DEMONSTRATED SUCCESSFULLY                   #
+##############################################################################
+ [x] Error control    : Hamming codes (correct 1-bit, detect 2-bit)
+ [x] Flow control     : Go-Back-N sliding window + cumulative ACKs
+ [x] Error recovery   : timeouts + go-back-N retransmission
+ [x] In-order delivery: receiver delivers frames strictly in sequence
+ [x] Multiple access  : CSMA/CA carrier sense + backoff + RTS/CTS
+ [x] Packet inspection: PyShark detailed dissection of a real .pcap
+

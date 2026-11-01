@@ -1,0 +1,12 @@
+# Python package dependencies for the Data Link Layer project.
+# Install with:  pip install -r requirements.txt
+#
+# NOTE: PyShark also needs the external "tshark" program (part of Wireshark).
+#       It is NOT a pip package. Install it with your OS package manager:
+#           Ubuntu/Debian :  sudo apt-get install -y tshark
+#           macOS (brew)  :  brew install wireshark
+#           Fedora        :  sudo dnf install wireshark-cli
+#       Verify with:  tshark --version
+
+pyshark>=0.6      # reads the .pcap and dissects packets (needs tshark)
+scapy>=2.5        # builds real Ethernet frames and writes the .pcap
